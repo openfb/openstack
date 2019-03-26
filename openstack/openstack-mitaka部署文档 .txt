@@ -1,0 +1,1938 @@
+openstack-mitaka部署
+
+	环境描述：
+	
+		controller	4GB内存		
+			eth0: 10.0.0.11/24
+			eth1: dhcp
+			
+		compute		4GB内存
+			eth0: 10.0.0.31/24
+			eth1: dhcp 
+			
+		cinder  块存储节点 
+		
+
+一、环境准备
+
+1、配置各节点的IP地址及主机名解析
+
+[root@controller ~]# cat /etc/hosts
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+
+10.0.0.11	controller
+10.0.0.31	compute
+
+
+2、配置时间同步
+
+3、配置openstack-mitaka的yum源
+
+[root@controller ~]# cat /etc/yum.repos.d/openstack.repo 
+[openstack]
+name=openstack-mitaka
+baseurl=http://mirrors.163.com/centos/7.3.1611/cloud/x86_64/openstack-mitaka/
+enabled=1
+gpgcheck=0
+[root@controller ~]# 
+
+使用# yum upgrade升级软件，升级完成后，需要reboot系统  
+
+[root@controller ~]# cat /etc/redhat-release 
+CentOS Linux release 7.3.1611 (Core) 
+[root@controller ~]# 
+
+
+4、安装python-openstack客户端软件 
+
+# yum install python-openstackclient
+
+
+在控制controller节点安装以下软件:
+
+
+5、安装配置Mariadb数据库
+
+[root@controller ~]# yum install -y mariadb mariadb-server python2-PyMySQL
+
+[root@controller ~]# cat /etc/my.cnf.d/openstack.cnf 
+
+	[mysqld]
+	bind-address = 10.0.0.11
+	default-storage-engine = innodb
+	innodb_file_per_table = 1
+	max_connections = 1000
+	collation-server = utf8_general_ci
+	character-set-server = utf8
+	
+[root@controller ~]# 
+
+[root@controller ~]# systemctl start mariadb
+[root@controller ~]# systemctl enable mariadb
+
+[root@controller ~]# mysql_secure_installation 
+
+
+6、安装mongodb数据库
+
+[root@controller ~]# yum install -y mongodb-server mongodb
+
+[root@controller ~]# vim /etc/mongod.conf 
+
+	bind_ip = 10.0.0.11
+	smallfiles = true
+
+
+[root@controller ~]# systemctl enable mongod
+[root@controller ~]# systemctl start mongod
+
+7、安装rabbitMQ消息队列
+
+[root@controller ~]# yum install -y rabbitmq-server
+[root@controller ~]# systemctl start rabbitmq-server
+[root@controller ~]# systemctl enable rabbitmq-server
+
+[root@controller ~]# rabbitmqctl add_user openstack redhat
+Creating user "openstack" ...
+
+[root@controller ~]# rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+Setting permissions for user "openstack" in vhost "/" ...
+[root@controller ~]# 
+
+8、安装memcached
+
+[root@controller ~]# yum install -y memcached python-memcached
+[root@controller ~]# systemctl start memcached.service 
+[root@controller ~]# systemctl enable memcached.service
+
+
+
+
+
+二、在控制节点安装部署keystone节点
+
+
+1、创建keystone数据库，并建立授权用户
+
+MariaDB [(none)]> CREATE DATABASE keystone;
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON keystone.* TO 'keystone'@'%' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> FLUSH PRIVILEGES;
+Query OK, 0 rows affected (0.00 sec)
+
+
+
+2、生成一个随机数，作为初始配置中管理员的令牌
+
+[root@controller ~]# openssl rand -hex 10
+dd35b0f37b37047208fb
+
+
+
+3、编辑keystone配置文件，指定令牌 
+
+[root@controller ~]# yum install -y openstack-keystone httpd mod_wsgi
+
+
+# vim /etc/keystone/keystone.conf 
+
+	[DEFAULT]
+	...
+	admin_token = <TOKEN>
+	
+	<TOKEN>将其替换成上述openssl命令生成的随机字符串
+	
+	[database]
+	
+	connection = mysql+pymysql://keystone:redhat@controller/keystone
+	
+	[token]
+	
+	provider = fernet
+
+4、初始化身份认证服务的数据库
+
+[root@controller ~]# su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+
+5、初始化fernet keys 
+
+[root@controller ~]# keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+
+
+6、配置httpd虚拟主机提供认证服务 
+
+# vim /etc/httpd/conf/httpd.conf 
+
+	ServerName controller 
+
+# vim /etc/httpd/conf.d/wsgi-keystone.conf 
+
+Listen 5000
+Listen 35357
+
+<VirtualHost *:5000>
+    WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-public
+    WSGIScriptAlias / /usr/bin/keystone-wsgi-public
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    ErrorLogFormat "%{cu}t %M"
+    ErrorLog /var/log/httpd/keystone-error.log
+    CustomLog /var/log/httpd/keystone-access.log combined
+
+    <Directory /usr/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+<VirtualHost *:35357>
+    WSGIDaemonProcess keystone-admin processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-admin
+    WSGIScriptAlias / /usr/bin/keystone-wsgi-admin
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    ErrorLogFormat "%{cu}t %M"
+    ErrorLog /var/log/httpd/keystone-error.log
+    CustomLog /var/log/httpd/keystone-access.log combined
+
+    <Directory /usr/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+
+[root@controller ~]# systemctl enable httpd
+Created symlink from /etc/systemd/system/multi-user.target.wants/httpd.service to /usr/lib/systemd/system/httpd.service.
+[root@controller ~]# systemctl start httpd
+[root@controller ~]# ss -antp | grep httpd
+LISTEN     0      128         :::5000                    :::*                   users:(("httpd",pid=28295,fd=6),("httpd",pid=28294,fd=6),("httpd",pid=28293,fd=6),("httpd",pid=28292,fd=6),("httpd",pid=28291,fd=6),("httpd",pid=28280,fd=6))
+LISTEN     0      128         :::80                      :::*                   users:(("httpd",pid=28295,fd=4),("httpd",pid=28294,fd=4),("httpd",pid=28293,fd=4),("httpd",pid=28292,fd=4),("httpd",pid=28291,fd=4),("httpd",pid=28280,fd=4))
+LISTEN     0      128         :::35357                   :::*                   users:(("httpd",pid=28295,fd=8),("httpd",pid=28294,fd=8),("httpd",pid=28293,fd=8),("httpd",pid=28292,fd=8),("httpd",pid=28291,fd=8),("httpd",pid=28280,fd=8))
+[root@controller ~]# 
+
+
+
+7、定义环境变量，用于保存keystone的令牌及endpoint
+
+
+[root@controller ~]# export OS_TOKEN=dd35b0f37b37047208fb
+[root@controller ~]# export OS_URL=http://controller:35357/v3
+[root@controller ~]# export OS_IDENTITY_API_VERSION=3
+
+
+8、创建身份认证Identity Service服务
+
+[root@controller ~]# openstack service create --name keystone --description "Openstack Identity" identity
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Openstack Identity               |
+| enabled     | True                             |
+| id          | 94f59f46e0bf4bfeb8d871934f0f9926 |
+| name        | keystone                         |
+| type        | identity                         |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+9、创建认证服务的三类endpoint
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> identity public http://controller:5000/v3
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | 85de47fcf5044742b7290cd41bff531f |
+| interface    | public                           |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 94f59f46e0bf4bfeb8d871934f0f9926 |
+| service_name | keystone                         |
+| service_type | identity                         |
+| url          | http://controller:5000/v3        |
++--------------+----------------------------------+
+
+
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+>  identity internal http://controller:5000/v3
+
+
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> identity admin http://controller:35357/v3
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | 0b0e7ac7f19a465cbeecd9dcb1298830 |
+| interface    | admin                            |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 94f59f46e0bf4bfeb8d871934f0f9926 |
+| service_name | keystone                         |
+| service_type | identity                         |
+| url          | http://controller:5000/v3        |
++--------------+----------------------------------+
+
+
+[root@controller ~]# openstack endpoint list
++---------------------------+-----------+--------------+--------------+---------+-----------+---------------------------+
+| ID                        | Region    | Service Name | Service Type | Enabled | Interface | URL                       |
++---------------------------+-----------+--------------+--------------+---------+-----------+---------------------------+
+| 0b0e7ac7f19a465cbeecd9dcb | RegionOne | keystone     | identity     | True    | admin     | http://controller:5000/v3 |
+| 1298830                   |           |              |              |         |           |                           |
+| 85de47fcf5044742b7290cd41 | RegionOne | keystone     | identity     | True    | public    | http://controller:5000/v3 |
+| bff531f                   |           |              |              |         |           |                           |
+| ea7d565a57334a838a87e4215 | RegionOne | keystone     | identity     | True    | internal  | http://controller:5000/v3 |
+| 45e9be2                   |           |              |              |         |           |                           |
++---------------------------+-----------+--------------+--------------+---------+-----------+---------------------------+
+[root@controller ~]# 
+
+
+
+10、创建最终用户登录进行keystone认证时， 需要的身份的信息
+
+1) 创建default域 
+
+[root@controller ~]# openstack domain create --description "Default Domain" default
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Default Domain                   |
+| enabled     | True                             |
+| id          | f7f44a8688ba4511b5736fe65952bb4e |
+| name        | default                          |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+2) 在default域中创建admin项目
+
+[root@controller ~]# openstack project create --domain default --description "Admin Project" admin
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Admin Project                    |
+| domain_id   | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled     | True                             |
+| id          | 6b1f664532184e829034be563be313b6 |
+| is_domain   | False                            |
+| name        | admin                            |
+| parent_id   | f7f44a8688ba4511b5736fe65952bb4e |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+3) 创建admin用户
+
+[root@controller ~]# openstack user create --domain default --password-prompt admin
+User Password:
+Repeat User Password:
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled   | True                             |
+| id        | 2aa2c376deb6491caafd75e961825ad4 |
+| name      | admin                            |
++-----------+----------------------------------+
+[root@controller ~]# 
+
+
+4) 创建admin角色 
+
+[root@controller ~]# openstack role create admin
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | None                             |
+| id        | fa9b6d9a266c49ff9dd8311eee6bd169 |
+| name      | admin                            |
++-----------+----------------------------------+
+
+
+5) 关联admin用户及admin角色 
+
+[root@controller ~]# openstack role add --project admin --user admin admin
+
+
+同样的做法，创建service项目，用户名为demo 
+
+[root@controller ~]# openstack project create --domain default --description "Service Project" service
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Service Project                  |
+| domain_id   | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled     | True                             |
+| id          | a2dd0c374a364d8c90791fe282b1eb4f |
+| is_domain   | False                            |
+| name        | service                          |
+| parent_id   | f7f44a8688ba4511b5736fe65952bb4e |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+[root@controller ~]# openstack project create --domain default --description "Demo project" demo
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Demo project                     |
+| domain_id   | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled     | True                             |
+| id          | 0171ec74e07a48948e3e871bef1327fc |
+| is_domain   | False                            |
+| name        | demo                             |
+| parent_id   | f7f44a8688ba4511b5736fe65952bb4e |
++-------------+----------------------------------+
+
+
+[root@controller ~]# openstack user create --domain default --password-prompt demo
+User Password:
+Repeat User Password:
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled   | True                             |
+| id        | 24968e3a6bd644a69ee058d5c7d55eed |
+| name      | demo                             |
++-----------+----------------------------------+
+
+[root@controller ~]# openstack role create user
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | None                             |
+| id        | 6a44426bbb41475ea3d4f02197e093a8 |
+| name      | user                             |
++-----------+----------------------------------+
+
+[root@controller ~]# openstack role add --project demo --user demo user
+
+
+验证以上创建的服务、项目、用户、角色
+
+[root@controller ~]# openstack project list
++----------------------------------+---------+
+| ID                               | Name    |
++----------------------------------+---------+
+| 0171ec74e07a48948e3e871bef1327fc | demo    |
+| 6b1f664532184e829034be563be313b6 | admin   |
+| a2dd0c374a364d8c90791fe282b1eb4f | service |
++----------------------------------+---------+
+[root@controller ~]# 
+
+
+[root@controller ~]# openstack user list
++----------------------------------+-------+
+| ID                               | Name  |
++----------------------------------+-------+
+| 24968e3a6bd644a69ee058d5c7d55eed | demo  |
+| 2aa2c376deb6491caafd75e961825ad4 | admin |
++----------------------------------+-------+
+
+[root@controller ~]# openstack role list
++----------------------------------+-------+
+| ID                               | Name  |
++----------------------------------+-------+
+| 6a44426bbb41475ea3d4f02197e093a8 | user  |
+| fa9b6d9a266c49ff9dd8311eee6bd169 | admin |
++----------------------------------+-------+
+
+
+
+验证keystone是否工作正常
+
+
+
+
+因为安全性的原因，关闭临时认证令牌机制：
+
+编辑 /etc/keystone/keystone-paste.ini 文件，从``[pipeline:public_api]``，[pipeline:admin_api]``和``[pipeline:api_v3]``部分删除``admin_token_auth 。
+
+重置``OS_TOKEN``和``OS_URL`` 环境变量：
+
+[root@controller ~]# unset OS_TOKEN OS_URL
+
+
+作为root用户，测试是否可以通过keystone认证，并获取令牌TOKEN
+
+[root@controller ~]# openstack --os-auth-url http://controller:35357/v3 \
+> --os-project-domain-name default --os-user-domain-name default \
+> --os-project-name admin --os-username admin token issue 
+Password: 
++------------+----------------------------------------------------------------------------------------------------------+
+| Field      | Value                                                                                                    |
++------------+----------------------------------------------------------------------------------------------------------+
+| expires    | 2017-07-25T03:42:18.000000Z                                                                              |
+| id         | gAAAAABZdrAKThJwRGZ6mG9b-                                                                                |
+|            | Z5yJQuTx6gbC5PKyNs33KSsynWZMpZKBOfBFzHXU2vObYGZpy4Q5shIy1eQVsRJVXZdNa1lOOChxxeTddh36TOe-RXmWA-           |
+|            | QXwr0m7RSRLUp_xceUdKpEN15UOR7RtyqEPbibyi5u6pw3eJWBM73yivGL_5Sk_k                                         |
+| project_id | 6b1f664532184e829034be563be313b6                                                                         |
+| user_id    | 2aa2c376deb6491caafd75e961825ad4                                                                         |
++------------+----------------------------------------------------------------------------------------------------------+
+[root@controller ~]# 
+
+
+
+作为demo用户，测试是否可以通过keystone认证，并获取令牌TOKEN
+
+[root@controller ~]# openstack --os-auth-url http://controller:5000/v3 \
+> --os-project-domain-name default --os-user-domain-name default \
+> --os-project-name demo --os-username demo token issue
+Password: 
++------------+----------------------------------------------------------------------------------------------------------+
+| Field      | Value                                                                                                    |
++------------+----------------------------------------------------------------------------------------------------------+
+| expires    | 2017-07-25T03:44:48.000000Z                                                                              |
+| id         | gAAAAABZdrCgYbiuyB_etFgmhTM09r_md5DxWVbYNsF7QRx8e0ZLBhXnyxwahB7x5oyTs4KNRTr9Mf5KWkFfd3o9biAaYX_Rf-       |
+|            | cwc_hSVaHHHT5kPv0n3E6qwjo0uUexQVgIUXmHkQpUIw9vkcvmaQJMczw-6R_6vhEcf3ypCnIaN5U1NbkTbA8                    |
+| project_id | 0171ec74e07a48948e3e871bef1327fc                                                                         |
+| user_id    | 24968e3a6bd644a69ee058d5c7d55eed                                                                         |
++------------+----------------------------------------------------------------------------------------------------------+
+[root@controller ~]# 
+
+
+为方便以后的测试，建议分别建立两个脚本
+
+1) 针对admin脚本
+
+[root@controller ~]# cat admin-openrc 
+
+export OS_PROJECT_DOMAIN_NAME=default
+export OS_USER_DOMAIN_NAME=default
+export OS_PROJECT_NAME=admin
+export OS_USERNAME=admin
+export OS_PASSWORD=redhat
+export OS_AUTH_URL=http://controller:35357/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_IMAGE_API_VERSION=2
+
+
+[root@controller ~]# source admin-openrc 
+
+
+[root@controller ~]# openstack token issue
++------------+---------------------------------------------------------------------------------------+
+| Field      | Value                                                                                 |
++------------+---------------------------------------------------------------------------------------+
+| expires    | 2017-07-25T03:52:38.000000Z                                                           |
+| id         | gAAAAABZdrJ2wMZW_cdyrvWW8D0YzA1n-                                                     |
+|            | U5UZvuHiySlcd4ycIlSmShMwcaGH23XyJtkXs9Pt2lcIn4SQxGz3s-afQN1z_M1BfjfWliyPEdK0gGK3boQhX |
+|            | DGswgD1_vq7t9EU1LxAowaLH7KXhPu44tMVgZvZS6qDfpZ52rz24BcOVfD-nPfFwQ                     |
+| project_id | 6b1f664532184e829034be563be313b6                                                      |
+| user_id    | 2aa2c376deb6491caafd75e961825ad4                                                      |
++------------+---------------------------------------------------------------------------------------+
+[root@controller ~]# 
+
+
+
+2) 针对demo脚本
+
+
+[root@controller ~]# vim demo-openrc 
+
+export OS_PROJECT_DOMAIN_NAME=default
+export OS_USER_DOMAIN_NAME=default
+export OS_PROJECT_NAME=demo
+export OS_USERNAME=demo
+export OS_PASSWORD=redhat
+export OS_AUTH_URL=http://controller:5000/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_IMAGE_API_VERSION=2
+[root@controller ~]# 
+
+
+[root@controller ~]# source demo-openrc
+[root@controller ~]# openstack token issue
++------------+----------------------------------------------------------------------------------------------------------+
+| Field      | Value                                                                                                    |
++------------+----------------------------------------------------------------------------------------------------------+
+| expires    | 2017-07-25T03:54:27.000000Z                                                                              |
+| id         | gAAAAABZdrLjMPNHpMKTs8PlTawCsaCYHlwAa_F2SVbBe4XtnRuJL-Ob-oyeDog-taGUd6REiXgpW5xxY4DmZ_q10GQIVdetfJz5yrI0 |
+|            | oQjI0OpMbFDkfjla6C6icWETM3nXvw3ZWvfc5zBvpB8Tn5t7P5m9qWPI9xAxBe9OGw7xhMpbQ6u4QNQ                          |
+| project_id | 0171ec74e07a48948e3e871bef1327fc                                                                         |
+| user_id    | 24968e3a6bd644a69ee058d5c7d55eed                                                                         |
++------------+----------------------------------------------------------------------------------------------------------+
+[root@controller ~]# 
+
+
+
+
+<===========================================================================================================================>
+
+安装部署glance镜像服务
+
+1、准备数据库
+
+MariaDB [(none)]> CREATE DATABASE glance;
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON glance.* TO 'glance'@'localhost' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON glance.* TO 'glance'@'%' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> FLUSH PRIVILEGES;
+Query OK, 0 rows affected (0.00 sec)
+
+
+2、创建glance用户，并关联admin角色
+
+[root@controller ~]# source admin-openrc 
+[root@controller ~]# openstack user create --domain default --password-prompt glance
+User Password:
+Repeat User Password:
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled   | True                             |
+| id        | 22a5f0e473c0489a981ae39229269d8d |
+| name      | glance                           |
++-----------+----------------------------------+
+
+[root@controller ~]# openstack role add --project service --user glance admin
+
+ 
+3、创建glance服务 
+
+[root@controller ~]# openstack service create --name glance --description "Openstack Image" image
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Openstack Image                  |
+| enabled     | True                             |
+| id          | 2ca3883d20fb43a6a73ffba22becfbad |
+| name        | glance                           |
+| type        | image                            |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+
+4、创建glance服务的endpoint
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> image public http://controller:9292 
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | 414a375b1b464ee8954a803b434aa488 |
+| interface    | public                           |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 2ca3883d20fb43a6a73ffba22becfbad |
+| service_name | glance                           |
+| service_type | image                            |
+| url          | http://controller:9292           |
++--------------+----------------------------------+
+[root@controller ~]# 
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> image internal http://controller:9292
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | 35c6115c7c9443359baa529f9ef75654 |
+| interface    | internal                         |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 2ca3883d20fb43a6a73ffba22becfbad |
+| service_name | glance                           |
+| service_type | image                            |
+| url          | http://controller:9292           |
++--------------+----------------------------------+
+[root@controller ~]# 
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> image admin http://controller:9292
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | 0c3b8aba49bb4b8d982a85f29f329e3c |
+| interface    | admin                            |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 2ca3883d20fb43a6a73ffba22becfbad |
+| service_name | glance                           |
+| service_type | image                            |
+| url          | http://controller:9292           |
++--------------+----------------------------------+
+[root@controller ~]# 
+
+
+5、安装glance软件 
+
+[root@controller ~]# yum install -y openstack-glance
+
+
+6、编辑glance-api配置文件 
+
+[root@controller ~]# vim /etc/glance/glance-api.conf 
+
+	[database]
+	
+	connection = mysql+pymysql://glance:redhat@controller/glance
+
+	[keystone_authtoken]
+
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = glance
+	password = redhat
+	
+	[paste_deploy]
+
+	flavor = keystone
+	
+	[glance_store]
+	
+	stores = file,http
+	default_store = file
+	filesystem_store_datadir = /var/lib/glance/images
+
+
+
+7、编辑glance-registry.conf文件 
+
+[root@controller ~]# vim /etc/glance/glance-registry.conf 
+
+	[database]
+	
+	connection = mysql+pymysql://glance:redhat@controller/glance
+	
+	[keystone_authtoken]
+
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = glance
+	password = redhat
+
+	
+	[paste_deploy]
+
+	flavor = keystone
+
+
+
+8、同步后台数据库 
+
+[root@controller ~]# su -s /bin/sh -c "glance-manage db_sync" glance
+
+
+9、启动glance相关服务 
+
+[root@controller ~]# systemctl enable openstack-glance-api.service openstack-glance-registry.service 
+
+[root@controller ~]# systemctl start openstack-glance-api.service openstack-glance-registry.service 
+[root@controller ~]# systemctl is-active openstack-glance-api.service openstack-glance-registry.service 
+active
+active
+
+[root@controller ~]# ss -antp | grep glance
+LISTEN     0      128          *:9191                     *:*                   users:(("glance-registry",pid=429,fd=4),("glance-registry",pid=412,fd=4))
+LISTEN     0      128          *:9292                     *:*                   users:(("glance-api",pid=430,fd=4),("glance-api",pid=411,fd=4))
+[root@controller ~]# 
+
+
+10、下载镜像文件并添加 
+
+[root@controller ~]# source admin-openrc 
+[root@controller ~]# wget http://download.cirros-cloud.net/0.3.4/cirros-0.3.4-x86_64-disk.img
+
+[root@controller ~]# du -sh cirros-0.3.4-x86_64-disk.img 
+13M	cirros-0.3.4-x86_64-disk.img
+[root@controller ~]# 
+
+[root@controller ~]# openstack image create "cirrors-0.3.4" \
+> --file cirros-0.3.4-x86_64-disk.img \
+> --disk-format qcow2 --container-format bare \
+> --public
++------------------+------------------------------------------------------+
+| Field            | Value                                                |
++------------------+------------------------------------------------------+
+| checksum         | ee1eca47dc88f4879d8a229cc70a07c6                     |
+| container_format | bare                                                 |
+| created_at       | 2017-07-25T06:20:38Z                                 |
+| disk_format      | qcow2                                                |
+| file             | /v2/images/c33fad82-2a25-48ec-aba6-56160435e1ce/file |
+| id               | c33fad82-2a25-48ec-aba6-56160435e1ce                 |
+| min_disk         | 0                                                    |
+| min_ram          | 0                                                    |
+| name             | cirrors-0.3.4                                        |
+| owner            | 6b1f664532184e829034be563be313b6                     |
+| protected        | False                                                |
+| schema           | /v2/schemas/image                                    |
+| size             | 13287936                                             |
+| status           | active                                               |
+| tags             |                                                      |
+| updated_at       | 2017-07-25T06:20:38Z                                 |
+| virtual_size     | None                                                 |
+| visibility       | public                                               |
++------------------+------------------------------------------------------+
+[root@controller ~]# 
+
+[root@controller ~]# openstack image list
++--------------------------------------+---------------+--------+
+| ID                                   | Name          | Status |
++--------------------------------------+---------------+--------+
+| c33fad82-2a25-48ec-aba6-56160435e1ce | cirrors-0.3.4 | active |
++--------------------------------------+---------------+--------+
+[root@controller ~]# 
+
+
+
+
+
+<==========================================================================================================>
+
+安装部署nova计算服务
+
+一、在控制节点安装nova
+
+1、创建数据库，并准备授权用户
+
+MariaDB [(none)]> CREATE DATABASE nova_api;
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> CREATE DATABASE nova;
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON nova_api.* TO 'nova'@'localhost' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON nova_api.* TO 'nova'@'%' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON nova.* TO 'nova'@'localhost' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON nova.* TO 'nova'@'%' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> FLUSH PRIVILEGES;
+Query OK, 0 rows affected (0.00 sec)
+
+
+2、创建nova用户
+
+[root@controller ~]# source admin-openrc 
+
+[root@controller ~]# openstack user create --domain default --password-prompt nova
+User Password:
+Repeat User Password:
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled   | True                             |
+| id        | d0c1ca96f59a49b7a452463f98ae4235 |
+| name      | nova                             |
++-----------+----------------------------------+
+[root@controller ~]# 
+
+[root@controller ~]# openstack role add --project service --user nova admin
+
+
+3、创建nova服务
+
+[root@controller ~]# openstack service create --name nova \
+> --description "Openstack Compute" compute
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Openstack Compute                |
+| enabled     | True                             |
+| id          | 48c4491a432140bab32f3504355e3683 |
+| name        | nova                             |
+| type        | compute                          |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+4、创建nova服务的endpoint
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> compute public http://controller:8774/v2.1/%\(tenant_id\)s
++--------------+-------------------------------------------+
+| Field        | Value                                     |
++--------------+-------------------------------------------+
+| enabled      | True                                      |
+| id           | b8fc9f8b69aa43b3a9b8cd17a28e2a47          |
+| interface    | public                                    |
+| region       | RegionOne                                 |
+| region_id    | RegionOne                                 |
+| service_id   | 48c4491a432140bab32f3504355e3683          |
+| service_name | nova                                      |
+| service_type | compute                                   |
+| url          | http://controller:8774/v2.1/%(tenant_id)s |
++--------------+-------------------------------------------+
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> compute internal http://controller:8774/v2.1/%\(tenant_id\)s
++--------------+-------------------------------------------+
+| Field        | Value                                     |
++--------------+-------------------------------------------+
+| enabled      | True                                      |
+| id           | da7268d4f26644f4beed1032a0231ee6          |
+| interface    | internal                                  |
+| region       | RegionOne                                 |
+| region_id    | RegionOne                                 |
+| service_id   | 48c4491a432140bab32f3504355e3683          |
+| service_name | nova                                      |
+| service_type | compute                                   |
+| url          | http://controller:8774/v2.1/%(tenant_id)s |
++--------------+-------------------------------------------+
+
+[root@controller ~]# openstack endpoint create --region RegionOne compute admin http://controller:8774/v2.1/%\(tenant_id\)s
++--------------+-------------------------------------------+
+| Field        | Value                                     |
++--------------+-------------------------------------------+
+| enabled      | True                                      |
+| id           | e6508b3eb1364c219336762ebfa81a2e          |
+| interface    | admin                                     |
+| region       | RegionOne                                 |
+| region_id    | RegionOne                                 |
+| service_id   | 48c4491a432140bab32f3504355e3683          |
+| service_name | nova                                      |
+| service_type | compute                                   |
+| url          | http://controller:8774/v2.1/%(tenant_id)s |
++--------------+-------------------------------------------+
+[root@controller ~]# 
+
+
+5、安装nova软件 
+
+[root@controller ~]# yum install -y openstack-nova-api openstack-nova-conductor openstack-nova-console openstack-nova-novncproxy openstack-nova-scheduler
+
+
+6、编辑nova配置文件 
+
+[root@controller ~]# vim /etc/nova/nova.conf 
+
+	[DEFAULT]
+
+	enabled_apis=osapi_compute,metadata
+	
+	rpc_backend=rabbit
+
+	auth_strategy=keystone
+	
+	my_ip = 10.0.0.11
+
+	use_neutron = true
+	firewall_driver = nova.virt.firewall.NoopFirewallDriver
+
+
+
+	[api_database]
+
+	connection = mysql+pymysql://nova:redhat@controller/nova_api
+
+	
+	[database]
+	
+	connection = mysql+pymysql://nova:redhat@controller/nova
+
+
+	[oslo_messaging_rabbit]
+	
+	rabbit_host = controller
+	rabbit_userid = openstack
+	rabbit_password = redhat
+
+
+	[keystone_authtoken]
+
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = nova
+	password = redhat
+	
+	[vnc]
+	vncserver_listen = $my_ip
+	vncserver_proxyclient_address = $my_ip
+
+	[glance]
+
+	api_servers = http://controller:9292
+
+	[oslo_concurrency]
+	
+	lock_path=/var/lib/nova/tmp
+
+	
+7、同步数据库
+
+[root@controller ~]# su -s /bin/sh -c "nova-manage api_db sync" nova
+[root@controller ~]# su -s /bin/sh -c "nova-manage db sync" nova
+
+
+8、启动nova服务
+
+[root@controller ~]# systemctl enable openstack-nova-api.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service 
+
+[root@controller ~]# systemctl start openstack-nova-api.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service 
+
+[root@controller ~]# systemctl is-active openstack-nova-api.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service 
+active
+active
+active
+active
+active
+
+
+
+
+二、在计算节点安装nova
+
+1、安装软件 
+
+[root@compute ~]# yum install -y openstack-nova-compute 
+
+
+2、编辑nova配置文件  
+
+[root@compute ~]# vim /etc/nova/nova.conf 
+
+	[DEFAULT]
+
+	rpc_backend=rabbit
+	
+	auth_strategy=keystone
+	
+	my_ip=10.0.0.31
+
+	use_neutron=true
+	firewall_driver = nova.virt.firewall.NoopFirewallDriver
+
+
+
+	[oslo_messaging_rabbit]
+
+	rabbit_host = controller
+	rabbit_userid = openstack
+	rabbit_password = redhat
+
+
+	[keystone_authtoken]
+
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = nova
+	password = redhat
+
+
+	[vnc]
+	
+	enabled = true
+	vncserver_listen = 0.0.0.0
+	vncserver_proxyclient_address = $my_ip
+	novncproxy_base_url = http://controller:6080/vnc_auto.html
+
+
+	[glance]
+
+	api_servers=http://controller:9292
+
+	[oslo_concurrency]
+
+	lock_path=/var/lib/nova/tmp
+
+
+---------------------针对kvm虚拟机启用虚拟化-----------------------------
+
+1、使用以下命令确认CPU是否支持虚拟化
+
+[root@compute ~]# egrep -c '(vmx|svm)' /proc/cpuinfo
+0
+
+如果此命令返回0，代表不支持虚拟化，需要做如下操作：
+
+[root@compute ~]# vim /etc/nova/nova.conf 
+
+	[libvirt]
+
+	virt_type=qemu
+
+
+----------------------------------------------------------------------------
+
+3、启动计算节点服务 
+
+[root@compute ~]# systemctl enable libvirtd openstack-nova-compute.service 
+
+[root@compute ~]# systemctl start libvirtd openstack-nova-compute.service
+[root@compute ~]# systemctl is-active libvirtd openstack-nova-compute.service
+active
+active
+
+
+
+
+验证compute服务是否工作正常，在控制节点执行以下命令
+
+[root@controller ~]# source admin-openrc 
+
+[root@controller ~]# openstack compute service list
++----+------------------+------------+----------+---------+-------+----------------------------+
+| Id | Binary           | Host       | Zone     | Status  | State | Updated At                 |
++----+------------------+------------+----------+---------+-------+----------------------------+
+|  1 | nova-consoleauth | controller | internal | enabled | up    | 2017-07-25T08:05:39.000000 |
+|  2 | nova-conductor   | controller | internal | enabled | up    | 2017-07-25T08:05:39.000000 |
+|  3 | nova-scheduler   | controller | internal | enabled | up    | 2017-07-25T08:05:39.000000 |
+|  6 | nova-compute     | compute    | nova     | enabled | up    | 2017-07-25T08:05:41.000000 |
++----+------------------+------------+----------+---------+-------+----------------------------+
+[root@controller ~]# 
+
+
+
+<=========================================================================================================================>
+
+安装部署neutron网络服务 
+
+
+一、在控制节点安装neutron
+
+
+1、准备neutron数据库
+
+MariaDB [(none)]> CREATE DATABASE neutron;
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON neutron.* TO 'neutron'@'%' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> FLUSH PRIVILEGES;
+Query OK, 0 rows affected (0.00 sec)
+
+
+2、创建neutron用户，关联admin角色 
+
+[root@controller ~]# source admin-openrc 
+
+[root@controller ~]# openstack user create --domain default --password-prompt neutron
+User Password:
+Repeat User Password:
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | f7f44a8688ba4511b5736fe65952bb4e |
+| enabled   | True                             |
+| id        | fa003fb879ee42908645430f979c19a0 |
+| name      | neutron                          |
++-----------+----------------------------------+
+
+[root@controller ~]# openstack role add --project service --user neutron admin
+[root@controller ~]# 
+
+
+3、创建neutron服务及endpoint
+
+[root@controller ~]# openstack service create --name neutron --description "Openstack network" network+-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Openstack network                |
+| enabled     | True                             |
+| id          | 726eb76ed2f3421f93b704a8b3ee227b |
+| name        | neutron                          |
+| type        | network                          |
++-------------+----------------------------------+
+[root@controller ~]# 
+
+
+[root@controller ~]# openstack endpoint create --region RegionOne \
+> network public http://controller:9696
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | a367a3b7250e413d8da0f2830481fc85 |
+| interface    | public                           |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 726eb76ed2f3421f93b704a8b3ee227b |
+| service_name | neutron                          |
+| service_type | network                          |
+| url          | http://controller:9696           |
++-------------+-----------------------------------+
+
+[root@controller ~]# openstack endpoint create --region RegionOne network internal http://controller:9696
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | c69c2f29b3c3474bbc58b53e3d7b691d |
+| interface    | internal                         |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 726eb76ed2f3421f93b704a8b3ee227b |
+| service_name | neutron                          |
+| service_type | network                          |
+| url          | http://controller:9696           |
++--------------+----------------------------------+
+
+[root@controller ~]# openstack endpoint create --region RegionOne network admin http://controller:9696
++--------------+----------------------------------+
+| Field        | Value                            |
++--------------+----------------------------------+
+| enabled      | True                             |
+| id           | 2247a13289bc496c934bae73c11c6f6b |
+| interface    | admin                            |
+| region       | RegionOne                        |
+| region_id    | RegionOne                        |
+| service_id   | 726eb76ed2f3421f93b704a8b3ee227b |
+| service_name | neutron                          |
+| service_type | network                          |
+| url          | http://controller:9696           |
++--------------+----------------------------------+
+[root@controller ~]# 
+
+
+
+4、安装neutron相关软件 
+
+[root@controller ~]# yum install -y openstack-neutron openstack-neutron-ml2 openstack-neutron-linuxbridge ebtables 
+
+
+5、编辑neutron配置文件 
+
+[root@controller ~]# vim /etc/neutron/neutron.conf 
+
+	[database]
+
+	connection = mysql+pymysql://neutron:redhat@controller/neutron
+
+	[DEFAULT]
+
+	core_plugin = ml2
+
+	service_plugins = router
+
+	allow_overlapping_ips = True
+	
+	rpc_backend = rabbit
+	
+	auth_strategy = keystone
+	
+	notify_nova_on_port_status_changes = true
+	
+	notify_nova_on_port_data_changes = true
+
+
+
+
+	[oslo_messaging_rabbit]
+
+	rabbit_host = controller
+	rabbit_userid = openstack
+	rabbit_password = redhat
+
+
+	[keystone_authtoken]
+
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = neutron
+	password = redhat
+
+
+	[nova]
+
+	auth_url = http://controller:35357
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	region_name = RegionOne
+	project_name = service
+	username = nova
+	password = redhat
+
+
+	[oslo_concurrency]
+
+	lock_path = /var/lib/neutron/tmp
+
+
+6、配置Module Layer 2插件 
+
+[root@controller ~]# vim /etc/neutron/plugins/ml2/ml2_conf.ini 
+
+	[ml2]
+	
+	type_drivers = flat,vlan,vxlan
+
+	tenant_network_types = vxlan
+
+	mechanism_drivers = linuxbridge,l2population
+
+	extension_drivers = port_security
+
+	[ml2_type_flat]
+
+	flat_networks = provider
+
+	[ml2_type_vxlan]
+
+	vni_ranges = 1:1000
+
+	[securitygroup]
+
+	enable_ipset = true
+
+
+
+7、配置Linux-Bridge代理 
+
+[root@controller ~]# vim /etc/neutron/plugins/ml2/linuxbridge_agent.ini 
+
+	[linux_bridge]
+
+	physical_interface_mappings = provider:eth0
+
+	[vxlan]
+
+	enable_vxlan = true
+	local_ip = 10.0.0.11
+	l2_population = true
+
+	[securitygroup]
+	
+	enable_security_group = true
+	firewall_driver = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+
+
+
+8、配置Layer 3代理 ，提供路由、NAT功能
+
+[root@controller ~]# vim /etc/neutron/l3_agent.ini 
+
+	[DEFAULT]
+
+	interface_driver = neutron.agent.linux.interface.BridgeInterfaceDriver
+
+	external_network_bridge = 
+
+
+9、配置DHCP代理 
+
+[root@controller ~]# vim /etc/neutron/dhcp_agent.ini 
+
+	[DEFAULT]
+
+	interface_driver = neutron.agent.linux.interface.BridgeInterfaceDriver
+
+	dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq
+
+	enable_isolated_metadata = true
+
+
+
+10、配置元数据代理 
+
+[root@controller ~]# vim /etc/neutron/metadata_agent.ini 
+
+	[DEFAULT]
+
+	nova_metadata_ip = controller
+
+	metadata_proxy_shared_secret = redhat
+
+	
+11、编辑nova配置文件
+
+[root@controller ~]# vim /etc/nova/nova.conf 
+
+	[neutron]
+
+	url = http://controller:9696
+	auth_url = http://controller:35357
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	region_name = RegionOne
+	project_name = service
+	username = neutron
+	password = redhat
+
+	service_metadata_proxy = true
+	metadata_proxy_shared_secret = redhat
+
+
+
+12、为ml2插件配置文件建立超链接
+
+[root@controller ~]# ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+
+13、同步数据库
+
+[root@controller ~]# su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf \
+> --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+
+
+14、启动相关服务 
+
+[root@controller ~]# systemctl restart openstack-nova-api.service 
+
+
+[root@controller ~]# systemctl enable neutron-server.service neutron-linuxbridge-agent.service neutron-dhcp-agent.service neutron-metadata-agent.service neutron-l3-agent.service 
+
+[root@controller ~]# systemctl start neutron-server.service neutron-linuxbridge-agent.service neutron-dhcp-agent.service neutron-metadata-agent.service neutron-l3-agent.service 
+
+[root@controller ~]# systemctl is-active neutron-server.service neutron-linuxbridge-agent.service neutron-dhcp-agent.service neutron-metadata-agent.service neutron-l3-agent.service 
+active
+active
+active
+active
+active
+
+
+
+
+二、在计算节点安装neutron
+
+1、安装软件 
+
+[root@compute ~]# yum install -y openstack-neutron-linuxbridge ebtables ipset 
+
+2、编辑neutron配置文件  
+
+[root@compute ~]# vim /etc/neutron/neutron.conf 
+
+	[DEFAULT]
+
+	rpc_backend = rabbit
+	
+	auth_strategy = keystone
+
+
+	[oslo_messaging_rabbit]
+
+	rabbit_host = controller
+	rabbit_userid = openstack
+	rabbit_password = redhat
+
+	[keystone_authtoken]
+
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = neutron
+	password = redhat
+
+
+	[oslo_concurrency]
+
+	lock_path = /var/lib/neutron/tmp
+
+
+3、配置网络选项
+
+[root@compute ~]# vim /etc/neutron/plugins/ml2/linuxbridge_agent.ini 
+
+	[linux_bridge]
+
+	physical_interface_mappings = provider:eth0
+
+	[vxlan]
+
+	enable_vxlan = true
+	local_ip = 10.0.0.31
+	l2_population = true
+
+	[securitygroup]
+
+	enable_security_group = true
+	firewall_driver = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+
+
+4、编辑nova配置文件 
+
+[root@compute ~]# vim /etc/nova/nova.conf 
+
+	[neutron]
+
+	url = http://controller:9696
+	auth_url = http://controller:35357
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	region_name = RegionOne
+	project_name = service
+	username = neutron
+	password = redhat
+
+5、启动相应服务 
+
+[root@compute ~]# systemctl restart openstack-nova-compute.service 
+
+[root@compute ~]# systemctl enable neutron-linuxbridge-agent.service 
+[root@compute ~]# systemctl start neutron-linuxbridge-agent.service 
+[root@compute ~]# systemctl is-active neutron-linuxbridge-agent.service
+active
+
+
+
+在控制节点验证neutron配置
+
+[root@controller ~]# source admin-openrc 
+[root@controller ~]# neutron ext-list
++---------------------------+-----------------------------------------------+
+| alias                     | name                                          |
++---------------------------+-----------------------------------------------+
+| default-subnetpools       | Default Subnetpools                           |
+| network-ip-availability   | Network IP Availability                       |
+| network_availability_zone | Network Availability Zone                     |
+| auto-allocated-topology   | Auto Allocated Topology Services              |
+| ext-gw-mode               | Neutron L3 Configurable external gateway mode |
+| binding                   | Port Binding                                  |
+| agent                     | agent                                         |
+| subnet_allocation         | Subnet Allocation                             |
+| l3_agent_scheduler        | L3 Agent Scheduler                            |
+| tag                       | Tag support                                   |
+| external-net              | Neutron external network                      |
+| net-mtu                   | Network MTU                                   |
+| availability_zone         | Availability Zone                             |
+| quotas                    | Quota management support                      |
+| l3-ha                     | HA Router extension                           |
+| provider                  | Provider Network                              |
+| multi-provider            | Multi Provider Network                        |
+| address-scope             | Address scope                                 |
+| extraroute                | Neutron Extra Route                           |
+| timestamp_core            | Time Stamp Fields addition for core resources |
+| router                    | Neutron L3 Router                             |
+| extra_dhcp_opt            | Neutron Extra DHCP opts                       |
+| security-group            | security-group                                |
+| dhcp_agent_scheduler      | DHCP Agent Scheduler                          |
+| router_availability_zone  | Router Availability Zone                      |
+| rbac-policies             | RBAC Policies                                 |
+| standard-attr-description | standard-attr-description                     |
+| port-security             | Port Security                                 |
+| allowed-address-pairs     | Allowed Address Pairs                         |
+| dvr                       | Distributed Virtual Router                    |
++---------------------------+-----------------------------------------------+
+
+
+[root@controller ~]# neutron agent-list
++-------------------+-------------------+------------+-------------------+-------+----------------+---------------------+
+| id                | agent_type        | host       | availability_zone | alive | admin_state_up | binary              |
++-------------------+-------------------+------------+-------------------+-------+----------------+---------------------+
+| 1521c9b3-4528-42a | Metadata agent    | controller |                   | :-)   | True           | neutron-metadata-   |
+| 6-82f4-354c5805dd |                   |            |                   |       |                | agent               |
+| 85                |                   |            |                   |       |                |                     |
+| 60bb2692-c778-478 | Linux bridge      | compute    |                   | :-)   | True           | neutron-            |
+| 3-8263-cdae85fb0b | agent             |            |                   |       |                | linuxbridge-agent   |
+| 17                |                   |            |                   |       |                |                     |
+| a2a1139d-099c-    | Linux bridge      | controller |                   | :-)   | True           | neutron-            |
+| 4cd1-879f-        | agent             |            |                   |       |                | linuxbridge-agent   |
+| db1c5f4e728b      |                   |            |                   |       |                |                     |
+| ae45bd9c-e73c-    | DHCP agent        | controller | nova              | :-)   | True           | neutron-dhcp-agent  |
+| 4c65-bfbb-        |                   |            |                   |       |                |                     |
+| 02607f289a6d      |                   |            |                   |       |                |                     |
+| ba43471f-b095     | L3 agent          | controller | nova              | :-)   | True           | neutron-l3-agent    |
+| -4b1c-            |                   |            |                   |       |                |                     |
+| beb7-839ea39041be |                   |            |                   |       |                |                     |
++-------------------+-------------------+------------+-------------------+-------+----------------+---------------------+
+[root@controller ~]# 
+
+
+
+<===============================================================================================================>
+
+
+安装配置DashBoard 
+
+1、安装dashboard软件 
+
+[root@controller ~]# yum install -y openstack-dashboard
+
+2、编辑dashboard配置文件 
+
+[root@controller ~]# vim /etc/openstack-dashboard/local_settings 
+
+	OPENSTACK_HOST = "controller"
+	ALLOWED_HOSTS = ['*', ]
+
+	SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+
+
+	CACHES = {
+		'default': {
+			'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+			'LOCATION': 'controller:11211',
+		},
+	}
+
+
+	OPENSTACK_KEYSTONE_URL = "http://%s:5000/v3" % OPENSTACK_HOST
+
+	OPENSTACK_API_VERSIONS = {
+		"identity": 3,
+		"image": 2,
+		"volume": 2,
+	}
+	
+	OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True
+
+	OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = 'default'
+	OPENSTACK_KEYSTONE_DEFAULT_ROLE = "user"
+
+	TIME_ZONE = "UTC"
+	
+	
+3、编辑memcached配置文件，指定监听的IP地址
+
+[root@controller ~]# cat /etc/sysconfig/memcached 
+PORT="11211"
+USER="memcached"
+MAXCONN="1024"
+CACHESIZE="64"
+OPTIONS="-l 10.0.0.11,::1"
+
+
+4、重启httpd, memcached服务 
+
+[root@controller ~]# systemctl restart httpd memcached 
+
+
+在浏览器中通过以下链接访问dashboard
+
+http://controller/dashboard
+
+
+
+
+在CentOS 7.3.1611系统上创建云主机时会无法启动, 原因是计算节点的QEMU版本过低，需要升级QEMU
+
+
+
+
+
+安装部署cinder提供块存储服务  
+
+
+块存储服务（cinder）为实例提供块存储。存储的分配和消耗是由块存储驱动器，或者多后端配置的驱动器决定的。还有很多驱动程序可用：NAS/SAN，NFS，ISCSI，Ceph等。
+
+典型情况下，块服务API和调度器服务运行在控制节点上
+
+
+一、在控制节点安装cinder 
+
+1、创建cider数据库
+
+MariaDB [(none)]> CREATE DATABASE cinder;
+Query OK, 1 row affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON cinder.* TO 'cinder'@'localhost' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON cinder.* TO 'cinder'@'controller' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> GRANT all ON cinder.* TO 'cinder'@'%' IDENTIFIED BY 'redhat';
+Query OK, 0 rows affected (0.00 sec)
+
+MariaDB [(none)]> FLUSH PRIVILEGES;
+Query OK, 0 rows affected (0.00 sec)
+
+
+2、创建cinder用户
+
+[root@controller ~]# source admin-openrc 
+
+[root@controller ~]# openstack user create --domain default --password-prompt cinder
+User Password:
+Repeat User Password:
++-----------+----------------------------------+
+| Field     | Value                            |
++-----------+----------------------------------+
+| domain_id | 96cbbc653f324989aafa6664bf2d827a |
+| enabled   | True                             |
+| id        | 1934a02e614f4622a89e001651e5ce29 |
+| name      | cinder                           |
++-----------+----------------------------------+
+[root@controller ~]# openstack role add --project service --user cinder admin
+
+
+3、创建cider服务 
+
+[root@controller ~]# openstack service create --name cinder \
+> --description "Openstack Block Storage" volume
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Openstack Block Storage          |
+| enabled     | True                             |
+| id          | 197446d1605c4e23a6cc341547c41221 |
+| name        | cinder                           |
+| type        | volume                           |
++-------------+----------------------------------+
+[root@controller ~]# openstack service create --name cinderv2 \
+> --description "Openstack Block Storage" volumev2
++-------------+----------------------------------+
+| Field       | Value                            |
++-------------+----------------------------------+
+| description | Openstack Block Storage          |
+| enabled     | True                             |
+| id          | 93d57cb3401944859c7b8a7936fcbf08 |
+| name        | cinderv2                         |
+| type        | volumev2                         |
++-------------+----------------------------------+
+
+
+
+4、创建cider服务的Endpoint访问端点 
+
+1) 创建服务volume的endpoint
+
+[root@controller ~]# openstack endpoint create --region RegionOne volume public http://controller:8776/v1/%\(tenant_id\)s
+
+[root@controller ~]# openstack endpoint create --region RegionOne volume internal http://controller:8776/v1/%\(tenant_id\)s
+
+[root@controller ~]# openstack endpoint create --region RegionOne volume admin http://controller:8776/v1/%\(tenant_id\)s
+
+
+2) 创建服务volumev2的endpoint
+
+[root@controller ~]# openstack endpoint create --region RegionOne volumev2 public http://controller:8776/v2/%\(tenant_id\)s
+
+[root@controller ~]# openstack endpoint create --region RegionOne volumev2 internal http://controller:8776/v2/%\(tenant_id\)s
+
+[root@controller ~]# openstack endpoint create --region RegionOne volumev2 admin http://controller:8776/v2/%\(tenant_id\)s
+
+
+
+5、安装cinder软件 
+
+[root@controller ~]# yum install -y openstack-cinder 
+
+
+6、编辑cinder的配置文件 
+
+[root@controller ~]# vim /etc/cinder/cinder.conf 
+
+
+	[database]
+	
+	connection = mysql+pymysql://cinder:redhat@controller/cinder 
+		
+	[DEFAULT]
+
+	rpc_backend = rabbit
+	auth_strategy = keystone
+	my_ip = 10.0.0.11
+
+
+	[oslo_messaging_rabbit]
+	...
+	rabbit_host = controller
+	rabbit_userid = openstack
+	rabbit_password = redhat
+
+	[keystone_authtoken]
+	...
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = cinder
+	password = redhat
+
+	[oslo_concurrency]
+
+	lock_path = /var/lib/cinder/tmp
+
+
+7、初始化cinder数据库 
+
+[root@controller ~]# su -s /bin/sh -c "cinder-manage db sync" cinder
+
+
+8、配置nova使用cinder为vm提供块存储，重启nova服务 
+
+[root@controller ~]# vim /etc/nova/nova.conf 
+
+	[cinder]
+	os_region_name = RegionOne
+
+
+9、启动cinder服务 
+
+[root@controller ~]# systemctl enable openstack-cinder-api.service openstack-cinder-scheduler.service 
+[root@controller ~]# systemctl start openstack-cinder-api.service openstack-cinder-scheduler.service 
+[root@controller ~]# 
+
+
+二、配置块存储节点   /dev/vdb   50G
+
+
+1、安装lvm工具
+
+[root@block ~]# yum install -y lvm2 
+[root@block ~]# systemctl enable lvm2-lvmetad
+[root@block ~]# systemctl start lvm2-lvmetad
+[root@block ~]# systemctl is-active lvm2-lvmetad
+active
+
+[root@block ~]# pvcreate /dev/vdb
+[root@block ~]# vgcreate vg1 /dev/vdb
+
+
+2、编辑lvm.conf配置文件，设置允许实例使用的块设备
+
+[root@block ~]# vim /etc/lvm/lvm.conf 
+
+    filter = [ "a/vdb/","r/.*/" ]
+
+
+3、安装cinder相关软件 
+
+[root@block ~]# yum install -y openstack-cinder targetcli python-keystone
+
+
+4、编辑cinder.conf配置文件  
+
+
+
+	[database]
+	...
+	connection = mysql+pymysql://cinder:redhat@controller/cinder
+	
+	[DEFAULT]
+	
+	rpc_backend = rabbit
+	
+	auth_strategy = keystone
+	
+	my_ip = 10.0.0.41
+	
+	enabled_backends = lvm
+	
+	glance_api_servers = http://controller:9292
+
+
+
+	[oslo_messaging_rabbit]
+	...
+	rabbit_host = controller
+	rabbit_userid = openstack
+	rabbit_password = redhat
+
+	[keystone_authtoken]
+	...
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = cinder
+	password = redhat
+
+	[lvm]
+
+	volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver
+	volume_group = vg1
+	iscsi_protocol = iscsi
+	iscsi_helper = lioadm
+
+	[oslo_concurrency]
+	
+	lock_path = /var/lib/cinder/tmp
+
+5、启动存储服务 
+
+[root@block ~]# systemctl enable openstack-cinder-volume.service target.service 
+[root@block ~]# systemctl start openstack-cinder-volume.service target.service 
+
+[root@block ~]# systemctl is-active openstack-cinder-volume.service target.service 
+active
+active
+[root@block ~]# 
+
+
+6、在controller节点验证块存储服务
+
+[root@controller ~]# source admin-openrc 
+
+[root@controller ~]# cinder service-list
++------------------+------------+------+---------+-------+----------------------------+-----------------+
+|      Binary      |    Host    | Zone |  Status | State |         Updated_at         | Disabled Reason |
++------------------+------------+------+---------+-------+----------------------------+-----------------+
+| cinder-scheduler | controller | nova | enabled |   up  | 2017-10-20T07:47:30.000000 |        -        |
+|  cinder-volume   | block@lvm  | nova | enabled |   up  | 2017-10-20T07:47:35.000000 |        -        |
++------------------+------------+------+---------+-------+----------------------------+-----------------+
+[root@controller ~]# 
+
+
+在dashboard查看块存储服务 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

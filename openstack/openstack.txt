@@ -1,0 +1,301 @@
+云计算(Cloud Compute)服务
+
+	私有云
+	公有云
+	混合云
+	
+	根据提供服务的性质不同：
+	
+		Iaas	Infrastructure as a Service   基础设施即服务  
+		Saas	Software as a Service 		  软件即服务
+		Paas	Platform as a Service 		  软件平台即服务
+
+
+
+OpenStack介绍
+
+	Openstack是一个通过数据中心（datacenter）控制大量的计算（compute）、存储(storage)和网络(networking)资源的云操作系统平台；
+	所有的资源都可以通过面板（dashboard）被系统管理员管理，同时也可授权用户自由分配所需使用的资源。
+
+OpenStack组件
+
+1、Compute计算服务 (Nova)
+
+	管理虚拟机实例Instace。Nova负责创建、删除及迁移虚拟机；Nova本身不具备任何虚拟化能力，通过驱动Hypervisor的方式提供计算资源的虚拟化。
+	支持多种Hypervisor：KVM, LXC, QEMU, ESXI, XEN, PowerVM, Hyper-V
+	
+2、Network网络服务 (neutron)
+
+	提供网络服务，为虚拟机实例提供网络连接服务 
+	
+3、Image镜像服务 (Glance)
+
+	提供镜像管理
+	
+4、Identity认证服务 (Keystone)
+
+	提供身份验证服务。Keystone负责所有的服务请求的权限验证工作
+	
+5、Block storage块存储 (Cinder)
+
+	提供块存储服务。Cinder以虚拟磁盘的形式提供块存储设备
+	
+6、Object Storage对象存储 (swift)
+
+	分布式对象存储。Swift的目的是使用普通硬件来构建冗余的、可扩展的分布式对象存储集群
+	
+	
+7、DashBoard
+
+	提供GUI界面
+	
+	
+8、Telemetry (celiometer)	
+	
+	计费 
+	
+	
+为了方便各组件之间的通信，组件设计采用REST API的风格 
+
+OpenStack各组件间的通信采用AMQP(Advanced Message Queue Protocol)协议, RabbitMQ 
+
+各服务的内部组件采用RPC(Remote Procedure Call)的方式进行通信 
+	
+	
+
+	
+
+
+
+OpenStack Keystone基本概念
+
+	Keystone（OpenStack Identity Service）是OpenStack框架中，负责身份验证、服务规则和服务令牌的功能， 它实现了OpenStack的Identity API。Keystone类似一个服务总线，或者说是整个Openstack框架的注册表，其他服务通过keystone来注册其服务的Endpoint（服务访问的URL），任何服务之间相互的调用， 需要经过Keystone的身份验证， 来获得目标服务的Endpoint来找到目标服务。
+	
+	EndPoint服务端点URL：
+		public 
+		internal
+		admin 
+
+
+Keystone基本概念介绍
+
+　　1. User
+
+　　User即用户，他们代表可以通过keystone进行访问的人或程序。Users通过认证信息（credentials，如密码、API Keys等）进行验证。
+
+　　2. Tenant
+
+　　Tenant即租户，它是各个服务中的一些可以访问的资源集合。例如，在Nova中一个tenant可以是一些机器，在Swift和Glance中一个tenant可以是一些镜像存储，在Quantum中一个tenant可以是一些网络资源。Users默认的总是绑定到某些tenant上。
+
+　　3. Role
+
+　　Role即角色，Roles代表一组用户可以访问的资源权限，例如Nova中的虚拟机、Glance中的镜像。Users可以被添加到任意一个全局的 或 租户内的角色中。在全局的role中，用户的role权限作用于所有的租户，即可以对所有的租户执行role规定的权限；在租户内的role中，用户仅能在当前租户内执行role规定的权限。
+
+　　4. Service
+
+　　Service即服务，如Nova、Glance、Swift。根据前三个概念（User，Tenant和Role）一个服务可以确认当前用户是否具有访问其资源的权限。但是当一个user尝试着访问其租户内的service时，他必须知道这个service是否存在以及如何访问这个service，这里通常使用一些不同的名称表示不同的服务。在上文中谈到的Role，实际上也是可以绑定到某个service的。例如，当swift需要一个管理员权限的访问进行对象创建时，对于相同的role我们并不一定也需要对nova进行管理员权限的访问。为了实现这个目标，我们应该创建两个独立的管理员role，一个绑定到swift，另一个绑定到nova，从而实现对swift进行管理员权限访问不会影响到Nova或其他服务。
+
+　　5. Endpoint
+
+　　Endpoint，翻译为“端点”，我们可以理解它是一个服务暴露出来的访问点，如果需要访问一个服务，则必须知道他的endpoint。因此，在keystone中包含一个endpoint模板（endpoint template，在安装keystone的时候我们可以在conf文件夹下看到这个文件），这个模板提供了所有存在的服务endpoints信息。一个endpoint template包含一个URLs列表，列表中的每个URL都对应一个服务实例的访问地址，并且具有public、private和admin这三种权限。public url可以被全局访问（如http://compute.example.com），private url只能被局域网访问（如http://compute.example.local），admin url被从常规的访问中分离。
+	
+	
+	
+	
+	
+	
+OpenStack Nova计算服务 
+
+	OpenStack计算服务是基础设施即服务(IaaS)系统的主要部分，模块主要由Python实现。
+	
+	
+	应用程序接口 API 
+
+	1) nova-api service
+	
+		接收和响应来自最终用户的计算API请求。
+		
+	2) nova-api-metadata service
+		
+		接收来自于实例的metadata请求 
+
+		
+	计算服务核心
+	
+	1) nova-compute service 
+		
+		一个持续运行的守护进程，通过Hypervisor的API创建或者销毁虚拟机实例
+		
+	2) nova-shceduler service 
+	
+		拿到一个来自队列请求的虚拟机实例，然后决定那台计算服务器来运行它
+		
+	3) nova-conductor模块
+		
+		用于实现nova-compute服务和数据库间的交互
+		
+	4) nova-network 
+	
+		用于从队列接收网络任务然后操作网络  
+		
+	5) nova-consoleauth
+
+		用于实现用户通过vnc的方式连接虚拟机实例 
+	
+		
+	
+	
+OpenStack Network服务(Neutron)
+
+	Neutron是OpenStack 项目中负责提供网络服务的组件，它基于软件定义网络SDN的思想，实现了网络虚拟化下的资源管理。
+
+	功能：
+	
+		1) 提供虚拟交换机(Open Virtual Switch)
+		2) 基于L3提供虚拟路由器
+		3) dhcpagent, NAT, lb, fw, vpn
+		4) Network API 
+		
+	插件Plugins
+
+		1) Open vSwitch
+		2) Cisco UCS/Nexus
+		3) Linux Bridge
+		4) Nicira Network Virtualization Platform
+		5) Ryu OpenFlow Controller
+		6) NEC OpenFlow	
+		
+	Neutron管理下面的实体：
+	
+		1) network 
+			在Neutron中指的是二层网络 
+			
+		2) subnet
+			
+			三层网络
+			
+		3) port
+			
+			将主机连接进网络的接口
+			
+	
+	Tenant Network 
+	
+		1) Flat Network 
+		
+			扁平网络，所有虚拟机实例运行在同一个网络中，不支持vlan及其它隔离机制
+			
+		2) Local Network 
+		
+			所有虚拟机实例位于本地一个Compute节点，且与external隔离，不支持vlan 
+			
+		3) Vlan Network
+		
+			通过使用vlan id创建多个providers
+			
+		4) vxlan 
+		
+			隧道 
+			
+			
+		
+	架构 
+	
+	neutron-server 是 OpenStack Networking服务器的主要进程。它是一个 Python 后台进程，将用户请求从 OpenStack Networking API 中继到配置的插件。
+	OpenStack Networking 还包含 3 个代理，它们通过消息队列或标准 OpenStack Networking API 与主要 Neutron 进程交互：
+		1) neutron-dhcp-agent 向所有租户网络提供动态主机配置协议 (Dynamic Host Configuration Protocol, DHCP) 服务。
+		2) neutron-l3-agent 执行 L3/网络地址转换 (Network Address Translation) 转发，以支持网络网络访问租户网络上的 VM。
+		3) 一个特定于插件的可选代理 (neutron-*-agent) 在每个虚拟机管理程序上执行本地虚拟交换机配置
+	
+	
+	
+	
+	
+OpenStack Image(glance)
+
+	提供镜像服务
+
+	1) glance-api 
+	
+		接收REST API请求，然后通过其他模块来完成镜像查找、获取、上传、删除等操作
+		默认监听在9292端口
+		
+	2) glance-registry
+	
+		用于与MySQL数据交互，用于存储或获取镜像的元数据 
+		
+		通过glance-registry可以向数据为中写入或获取镜像的各种数据 
+		
+		默认监听在9191端口 
+		
+		
+		
+		
+OpenStack block storage(cinder)
+
+		主要核心是对卷的管理，允许对卷、卷的类型、卷的快照进行处理
+		
+		它并没有实现对块设备的管理和实际服务，而是为后端不同的存储结构提供了统一的接口，不同的块设备服务厂商在 Cinder 中实现其驱动支持以与 OpenStack 进行整合
+		
+		Cinder 服务
+		
+			1) API service：负责接受和处理 Rest 请求，并将请求放入RabbitMQ队列。
+			
+			2) Scheduler service: 处理任务队列的任务，并根据预定策略选择合适的 Volume Service 节点来执行任务。目前版本的 cinder 仅仅提供了一个 Simple Scheduler, 该调度器选择卷数量最少的一个活跃节点来创建卷。
+			
+			3) Volume service: 该服务运行在存储节点上，管理存储空间。每个存储节点都有一个 Volume Service，若干个这样的存储节点联合起来可以构成一个存储资源池。为了支持不同类型和型号的存储，当前版本的 Cinder 为 Volume Service 添加如下 drivers。当然在 Cinder 的 blueprints 当中还有一些其它的 drivers，以后的版本可能会添加进来。
+
+	
+	
+
+
+
+
+OpenStack image(swift)
+
+Swift组件包括：
+	1)
+	
+	代理服务（Proxy Server）：对外提供对象服务API，会根据环的信息来查找服务地址并转发用户请求至相应的账户、容器或者对象服务；由于采用无状态的 REST 请求协议，可以进行横向扩展来均衡负载。
+	
+	2)
+	认证服务（AuthenticationServer）：验证访问用户的身份信息，并获得一个对象访问令牌（Token），在一定的时间内会一直有效；验证访问令牌的有效性并缓存下来直至过期时间。
+	
+	3)
+	
+	缓存服务（Cache Server）：缓存的内容包括对象服务令牌，账户和容器的存在信息，但不会缓存对象本身的数据；缓存服务可采用 Memcached	集群，Swift 会使用一致性散列算法来分配缓存地址。
+	
+	4)
+	
+	账户服务（Account Server）：提供账户元数据和统计信息，并维护所含容器列表的服务，每个账户的信息被存储在一个 SQLite 数据库中。
+	
+	5)
+	
+	容器服务（Container Server）：提供容器元数据和统计信息，并维护所含对象列表的服务，每个容器的信息也存储在一个 SQLite 数据库中。
+	
+	6)
+	对象服务（ObjectServer）：提供对象元数据和内容服务，每个对象的内容会以文件的形式存储在文件系统中，元数据会作为文件属性来存储，建议采用支持扩展属性的 XFS 文件系统。
+	
+	7)
+	复制服务（Replicator）：会检测本地分区副本和远程副本是否一致，具体是通过对比散列文件和高级水印来完成，发现不一致时会采用推式（Push）更新远程副本，例如对象复制服务会使用远程文件拷贝工具 rsync 来同步；另外一个任务是确保被标记删除的对象从文件系统中移除。
+
+	8)
+	更新服务（Updater）：当对象由于高负载的原因而无法立即更新时，任务将会被序列化到在本地文件系统中进行排队，以便服务恢复后进行异步更新；例如成功创建对象后容器服务器没有及时更新对象列表，这个时候容器的更新操作就会进入排队中，更新服务会在系统恢复正常后扫描队列并进行相应的更新处理。
+	
+	9)
+	审计服务（Auditor）：检查对象，容器和账户的完整性，如果发现比特级的错误，文件将被隔离，并复制其他的副本以覆盖本地损坏的副本；其他类型的错误
+	会被记录到日志中。
+	
+	10)
+	账户清理服务（Account Reaper）：移除被标记为删除的账户，删除其所包含的所有容器和对象。
+
+
+
+
+
+
+
+
+
+	
+
